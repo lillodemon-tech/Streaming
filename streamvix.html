@@ -648,18 +648,70 @@
   <script>
     const TMDB_IMG = 'https://image.tmdb.org/t/p/';
     const SOURCES = {
-      vixsrc:     { movie: id => `https://vixsrc.to/movie/${id}?lang=it`,                       tv: (id,s,e) => `https://vixsrc.to/tv/${id}/${s}/${e}?lang=it` },
-      vidsrc:     { movie: id => `https://vidsrc.xyz/embed/movie/${id}`,                         tv: (id,s,e) => `https://vidsrc.xyz/embed/tv/${id}/${s}/${e}` },
-      superembed: { movie: id => `https://multiembed.mov/?video_id=${id}&tmdb=1`,                tv: (id,s,e) => `https://multiembed.mov/?video_id=${id}&tmdb=1&s=${s}&e=${e}` }
+      vixsrc:     { movie: (id,t) => `https://vixsrc.to/movie/${id}?lang=it${t?'&t='+t:''}`,                    tv: (id,s,e,t) => `https://vixsrc.to/tv/${id}/${s}/${e}?lang=it${t?'&t='+t:''}` },
+      vidsrc:     { movie: (id,t) => `https://vidsrc.xyz/embed/movie/${id}${t?'?t='+t:''}`,                     tv: (id,s,e,t) => `https://vidsrc.xyz/embed/tv/${id}/${s}/${e}${t?'?t='+t:''}` },
+      superembed: { movie: (id,t) => `https://multiembed.mov/?video_id=${id}&tmdb=1${t?'&t='+t:''}`,            tv: (id,s,e,t) => `https://multiembed.mov/?video_id=${id}&tmdb=1&s=${s}&e=${e}${t?'&t='+t:''}` }
     };
 
-    let apiKey          = localStorage.getItem('tmdb_api_key') || '';
-    let currentTab      = 'movie';
-    let heroItems       = [];
-    let heroIdx         = 0;
-    let heroInterval    = null;
+    let apiKey           = localStorage.getItem('tmdb_api_key') || '';
+    let currentTab       = 'movie';
+    let heroItems        = [];
+    let heroIdx          = 0;
+    let heroInterval     = null;
     let currentModalItem = null;
-    let currentSource   = 'vixsrc';
+    let currentSource    = 'vixsrc';
+
+    // ── watch timer (tracks seconds watched in current session) ──
+    let watchTimerInterval = null; // setInterval tick
+    let watchStartedAt     = null; // Date.now() when player started
+    let watchSecondsBase   = 0;    // seconds saved before this session
+
+    function startWatchTimer(baseSeconds) {
+      stopWatchTimer();
+      watchSecondsBase = baseSeconds || 0;
+      watchStartedAt   = Date.now();
+      // save progress every 5 seconds
+      watchTimerInterval = setInterval(() => {
+        if (!currentModalItem) return;
+        const elapsed  = Math.floor((Date.now() - watchStartedAt) / 1000);
+        const total    = watchSecondsBase + elapsed;
+        saveWatchProgress(total);
+      }, 5000);
+    }
+
+    function stopWatchTimer() {
+      if (watchTimerInterval) {
+        clearInterval(watchTimerInterval);
+        watchTimerInterval = null;
+      }
+      // flush current time immediately on stop
+      if (watchStartedAt && currentModalItem) {
+        const elapsed = Math.floor((Date.now() - watchStartedAt) / 1000);
+        saveWatchProgress(watchSecondsBase + elapsed);
+      }
+      watchStartedAt = null;
+    }
+
+    function saveWatchProgress(totalSeconds) {
+      if (!currentModalItem) return;
+      const { item, type } = currentModalItem;
+      const list = getCWList();
+      const idx  = list.findIndex(e => e.id === item.id && e.type === type);
+      if (idx === -1) return;
+
+      list[idx].watchedSeconds = totalSeconds;
+      // rough progress %: assume 100min for movies, 45min for TV episodes
+      const durationSec  = type === 'movie' ? 6000 : 2700;
+      list[idx].progress = Math.min(99, Math.round((totalSeconds / durationSec) * 100));
+      saveCWList(list);
+      renderCWSection(); // update progress bars live
+    }
+
+    function getWatchedSeconds(id, type) {
+      const list  = getCWList();
+      const entry = list.find(e => e.id === id && e.type === type);
+      return entry ? (entry.watchedSeconds || 0) : 0;
+    }
 
     // ─────────────────────────────────────────────
     //  CONTINUA A GUARDARE  –  helpers
@@ -1005,7 +1057,6 @@
 
       if (type === 'movie') {
         document.getElementById('episode-selector').style.display = 'none';
-        updatePlayerSource();
 
         // ── save / update CW entry ──
         upsertCW({
@@ -1017,46 +1068,53 @@
           overview: item.overview || ''
         });
 
+        // resume from saved position if coming from CW
+        const resumeSec = cwRestore ? (cwRestore.watchedSeconds || 0) : 0;
+        updatePlayerSource(resumeSec);
+
       } else {
         document.getElementById('episode-selector').style.display = 'block';
 
         // if restoring from CW, apply saved season/episode after selectors are ready
         if (cwRestore && cwRestore.season) {
-          // give the DOM a tick after setupSeasonSelector
           setTimeout(async () => {
             const seasonSel  = document.getElementById('season-select');
             seasonSel.value  = cwRestore.season;
             await loadEpisodes();
             const epSel = document.getElementById('episode-select');
             epSel.value = cwRestore.episode || 1;
-            updatePlayerSource();
+            updatePlayerSource(cwRestore.watchedSeconds || 0);
           }, 100);
         } else {
-          updatePlayerSource();
+          updatePlayerSource(0);
         }
       }
     }
 
-    function updatePlayerSource() {
+    function updatePlayerSource(resumeSeconds) {
       if (!currentModalItem) return;
       const { item, type } = currentModalItem;
       currentSource = document.getElementById('source-select').value;
       const source  = SOURCES[currentSource];
-      let url = '';
 
+      // if no explicit resumeSeconds passed, read from saved data
+      const t = (resumeSeconds != null)
+        ? resumeSeconds
+        : getWatchedSeconds(item.id, type);
+
+      let url = '';
       if (type === 'movie') {
-        url = source.movie(item.id);
+        url = source.movie(item.id, t || null);
       } else {
         const s = document.getElementById('season-select').value  || 1;
         const e = document.getElementById('episode-select').value || 1;
-        url = source.tv(item.id, s, e);
+        url = source.tv(item.id, s, e, t || null);
 
-        // save TV progress to CW
-        const epSel   = document.getElementById('episode-select');
-        const epOpt   = epSel.options[epSel.selectedIndex];
-        const epName  = epOpt ? epOpt.text.replace(/^Ep \d+: /, '') : '';
-        const title   = document.getElementById('modal-title').textContent;
-        const year    = document.getElementById('modal-year-badge').textContent;
+        const epSel  = document.getElementById('episode-select');
+        const epOpt  = epSel.options[epSel.selectedIndex];
+        const epName = epOpt ? epOpt.text.replace(/^Ep \d+: /, '') : '';
+        const title  = document.getElementById('modal-title').textContent;
+        const year   = document.getElementById('modal-year-badge').textContent;
 
         upsertCW({
           id: item.id, type: 'tv',
@@ -1068,14 +1126,16 @@
           season: parseInt(s), episode: parseInt(e), episodeName: epName
         });
       }
-      loadPlayer(url);
+      loadPlayer(url, t);
     }
 
-    function loadPlayer(src) {
+    function loadPlayer(src, resumeSeconds) {
       document.getElementById('player-frame').src = src;
+      startWatchTimer(resumeSeconds || 0);
     }
 
     function closeModal() {
+      stopWatchTimer();  // flush seconds before closing
       document.getElementById('modal').classList.remove('open');
       document.getElementById('player-frame').src = '';
       document.body.style.overflow = '';
@@ -1108,7 +1168,7 @@
       }
     }
 
-    function loadEpisode() { updatePlayerSource(); }
+    function loadEpisode() { updatePlayerSource(0); } // new manual episode: start from 0
 
     // ─────────────────────────────────────────────
     //  TOAST
