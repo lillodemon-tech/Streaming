@@ -306,6 +306,17 @@ footer a{color:var(--accent);text-decoration:none}
 const TMDB_IMG = 'https://image.tmdb.org/t/p/';
 const CW_KEY   = 'streamvix_cw';
 
+// Cache in memoria: evita JSON.stringify di oggetti TMDB nell'HTML
+// (causa DataCloneError su alcuni browser)
+var ITEM_CACHE = {}; // { "movie_123": item, "tv_456": item }
+
+function cacheItem(item, type) {
+  ITEM_CACHE[type + '_' + item.id] = item;
+}
+function getCachedItem(id, type) {
+  return ITEM_CACHE[type + '_' + id] || null;
+}
+
 const SOURCES = {
   vidsrc:     { movie: (id) => 'https://vidsrc.to/embed/movie/' + id,
                 tv:    (id,s,e) => 'https://vidsrc.to/embed/tv/' + id + '/' + s + '/' + e },
@@ -371,18 +382,47 @@ function saveProgress(totalSec) {
 function getCW() {
   try { return JSON.parse(localStorage.getItem(CW_KEY)) || []; } catch(e) { return []; }
 }
-function saveCW(list) { localStorage.setItem(CW_KEY, JSON.stringify(list)); }
+
+// Sanifica entry: conserva solo primitivi per evitare DataCloneError
+function sanitizeCWEntry(entry) {
+  return {
+    id:           Number(entry.id)            || 0,
+    type:         String(entry.type)          || 'movie',
+    title:        String(entry.title || '')   || '',
+    year:         String(entry.year  || '')   || '',
+    poster:       entry.poster   ? String(entry.poster)   : null,
+    backdrop:     entry.backdrop ? String(entry.backdrop) : null,
+    rating:       Number(entry.rating)        || 0,
+    overview:     String(entry.overview || '') || '',
+    season:       entry.season   ? Number(entry.season)   : undefined,
+    episode:      entry.episode  ? Number(entry.episode)  : undefined,
+    episodeName:  entry.episodeName ? String(entry.episodeName) : undefined,
+    progress:     Number(entry.progress)      || 0,
+    watchedSeconds: Number(entry.watchedSeconds) || 0,
+    addedAt:      Number(entry.addedAt)       || Date.now()
+  };
+}
+
+function saveCW(list) {
+  try {
+    var safe = list.map(sanitizeCWEntry);
+    localStorage.setItem(CW_KEY, JSON.stringify(safe));
+  } catch(e) {
+    console.warn('saveCW error:', e);
+  }
+}
 
 function upsertCW(entry) {
   var list = getCW();
   var idx  = list.findIndex(function(e) { return e.id === entry.id && e.type === entry.type; });
   if (idx !== -1) {
     entry.progress = entry.progress != null ? entry.progress : (list[idx].progress || 0);
-    list[idx] = Object.assign({}, list[idx], entry);
+    entry.watchedSeconds = entry.watchedSeconds != null ? entry.watchedSeconds : (list[idx].watchedSeconds || 0);
+    list[idx] = sanitizeCWEntry(Object.assign({}, list[idx], entry));
   } else {
     entry.progress = entry.progress || 0;
     entry.addedAt  = Date.now();
-    list.unshift(entry);
+    list.unshift(sanitizeCWEntry(entry));
   }
   if (list.length > 20) list = list.slice(0, 20);
   saveCW(list);
@@ -424,10 +464,17 @@ function renderCW() {
 function resumeCW(id, type) {
   var entry = getCW().find(function(e) { return e.id === id && e.type === type; });
   if (!entry) return;
-  var fake = { id: entry.id, title: entry.title, name: entry.title,
-    poster_path: entry.poster, backdrop_path: entry.backdrop,
+  var fake = {
+    id: entry.id,
+    title: entry.title, name: entry.title,
+    poster_path: entry.poster,
+    backdrop_path: entry.backdrop,
     release_date: entry.year, first_air_date: entry.year,
-    vote_average: entry.rating, overview: entry.overview || '' };
+    vote_average: entry.rating,
+    overview: entry.overview || ''
+  };
+  // Metti in cache cosi openModalById funziona anche da CW
+  cacheItem(fake, type);
   openModal(fake, type, true, entry);
 }
 
@@ -484,6 +531,8 @@ function loadAll() {
 function loadHero() {
   tmdb('/trending/' + currentTab + '/week').then(function(d) {
     heroItems = d.results.slice(0, 6);
+    // Metti in cache gli hero items
+    heroItems.forEach(function(item) { cacheItem(item, currentTab); });
     heroIdx   = 0;
     renderHero(heroItems[0]);
     renderDots();
@@ -537,13 +586,15 @@ function loadRow(rowId, endpoint) {
 }
 
 function cardHTML(item, type) {
+  // Salva in cache per recuperarlo dopo — NESSUN JSON nell'HTML
+  cacheItem(item, type);
   var title  = (item.title || item.name || '—').replace(/</g, '&lt;');
   var year   = (item.release_date || item.first_air_date || '').substring(0, 4);
   var rating = item.vote_average ? item.vote_average.toFixed(1) : '—';
   var poster = item.poster_path ? TMDB_IMG + 'w342' + item.poster_path : '';
   var img    = poster ? '<img src="' + poster + '" alt="" loading="lazy">' : '<div class="no-img">No immagine</div>';
-  var enc    = encodeURIComponent(JSON.stringify(item));
-  return '<div class="card" onclick="openModalEnc(\'' + enc + '\',\'' + type + '\')">'
+  // Passa solo id (numero) e type (stringa breve) — zero rischio DataCloneError
+  return '<div class="card" onclick="openModalById(' + item.id + ',\'' + type + '\')">'
     + '<div class="card-overlay"><div class="card-play"><svg width="14" height="14" fill="#000" viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg></div></div>'
     + img
     + '<div class="card-info"><div class="card-title">' + title + '</div>'
@@ -551,8 +602,16 @@ function cardHTML(item, type) {
     + '<div class="card-rating">⭐ ' + rating + '</div></div></div>';
 }
 
-function openModalEnc(enc, type) {
-  openModal(JSON.parse(decodeURIComponent(enc)), type, false);
+function openModalById(id, type) {
+  var item = getCachedItem(id, type);
+  if (item) {
+    openModal(item, type, false);
+  } else {
+    // Fallback: scarica da TMDB se non in cache
+    tmdb('/' + type + '/' + id).then(function(d) {
+      openModal(d, type, false);
+    }).catch(function() { showToast('Errore caricamento'); });
+  }
 }
 
 // ── TABS ──
@@ -569,12 +628,18 @@ function closeSearch() { document.getElementById('search-overlay').classList.rem
 
 function doSearch(q) {
   if (!apiKey) { showToast('Imposta prima la API key'); return; }
+  document.getElementById('search-results').innerHTML = '<p style="color:var(--muted);font-size:13px;padding:8px">Ricerca in corso...</p>';
   tmdb('/search/multi', { query: q }).then(function(d) {
-    var results = d.results.filter(function(i) { return i.media_type === 'movie' || i.media_type === 'tv'; }).slice(0, 12);
+    var results = d.results.filter(function(i) {
+      return (i.media_type === 'movie' || i.media_type === 'tv') && i.id;
+    }).slice(0, 12);
     document.getElementById('search-results').innerHTML =
       results.map(function(i) { return cardHTML(i, i.media_type); }).join('') ||
-      '<p style="color:var(--muted);font-size:13px;padding:8px">Nessun risultato.</p>';
-  }).catch(function(e) { console.error(e); });
+      '<p style="color:var(--muted);font-size:13px;padding:8px">Nessun risultato trovato.</p>';
+  }).catch(function(e) {
+    console.error(e);
+    document.getElementById('search-results').innerHTML = '<p style="color:var(--muted);font-size:13px;padding:8px">Errore nella ricerca.</p>';
+  });
 }
 
 // ── BUILD URL ──
@@ -606,6 +671,8 @@ function openInNewTab() {
 function openModal(item, type, autoplay, cwRestore) {
   if (!item || !item.id) { showToast('ID non valido'); return; }
   currentModal = { item: item, type: type };
+  // Chiudi search overlay se aperto
+  closeSearch();
   document.getElementById('modal').classList.add('open');
   document.body.style.overflow = 'hidden';
   document.getElementById('cf-warning').classList.remove('show');
